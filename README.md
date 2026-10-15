@@ -1,10 +1,12 @@
 # DR Podcasts for Music Assistant
 
-A Music Assistant music provider for the DR podcasts that [drpodcast.nu](https://drpodcast.nu/) republishes as RSS.
+A Music Assistant music provider for the DR podcasts that [drpodcast.nu](https://drpodcast.nu/) republishes as RSS, and for the DR live radio channels.
 
-- Search matches the title and description of every podcast in the drpodcast.nu index, which is cached for 12 hours.
-- Browse lists the recently updated podcasts and all podcasts.
+- Search matches the title and description of every podcast in the drpodcast.nu index, which is cached for 12 hours, and the name of every radio channel.
+- Browse lists the recently updated podcasts, all podcasts and the live radio channels.
 - Podcasts added to the Music Assistant library are refreshed by the library sync. Episodes and streams come from the RSS feeds.
+- The radio channels are P1, P2, P3, P4 København, P5 København, P6 Beat and P8 Jazz. The library sync keeps all of them in the library.
+- A channel's HLS stream url is read from its dr.dk/lyd page when it is played and kept for 12 hours. If the page cannot be read, the last url that was found is used, and before any was found the fixed url in `dr_podcasts/radio.py`.
 
 ## Install
 

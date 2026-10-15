@@ -1,4 +1,4 @@
-"""DR Podcasts: search and play the DR podcasts that drpodcast.nu republishes as RSS."""
+"""DR Podcasts: the DR podcasts that drpodcast.nu republishes as RSS, and the DR live radio."""
 
 from __future__ import annotations
 
@@ -23,12 +23,16 @@ from music_assistant_models.media_items import (
     Podcast,
     PodcastEpisode,
     ProviderMapping,
+    Radio,
     SearchResults,
     UniqueList,
 )
 from music_assistant_models.streamdetails import StreamDetails
 
-from music_assistant.constants import CONF_ENTRY_LIBRARY_SYNC_PODCASTS
+from music_assistant.constants import (
+    CONF_ENTRY_LIBRARY_SYNC_PODCASTS,
+    CONF_ENTRY_LIBRARY_SYNC_RADIOS,
+)
 from music_assistant.helpers.podcast_parsers import (
     enrich_episode_chapters,
     find_episode_stream_url,
@@ -41,6 +45,14 @@ from music_assistant.helpers.podcast_parsers import (
 from music_assistant.models.music_provider import MusicProvider
 
 from .index import INDEX_URL, IndexEntry, parse_index, recently_updated, search_index
+from .radio import (
+    CHANNELS,
+    CHANNELS_BY_SLUG,
+    Channel,
+    StreamPageError,
+    StreamResolver,
+    search_channels,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Sequence
@@ -57,20 +69,34 @@ INDEX_CACHE_SECONDS = 12 * 3600
 INDEX_RETRY_SECONDS = 10 * 60
 INDEX_TIMEOUT = ClientTimeout(total=30)
 FEED_CACHE_SECONDS = 15 * 60
+STREAM_PAGE_TIMEOUT = ClientTimeout(total=10)
 BROWSE_RECENT = "recent"
 BROWSE_ALL = "all"
-BROWSE_FOLDERS = {BROWSE_RECENT: "Recently updated", BROWSE_ALL: "All podcasts"}
+BROWSE_RADIO = "radio"
+BROWSE_FOLDERS = {
+    BROWSE_RECENT: "Recently updated",
+    BROWSE_ALL: "All podcasts",
+    BROWSE_RADIO: "Live radio",
+}
 BROWSE_RECENT_COUNT = 50
 
 SUPPORTED_FEATURES = {
     ProviderFeature.SEARCH,
     ProviderFeature.BROWSE,
     ProviderFeature.LIBRARY_PODCASTS,
+    ProviderFeature.LIBRARY_RADIOS,
 }
 
 CONF_ENTRY_LIBRARY_SYNC_PODCASTS_HIDDEN = ConfigEntry.from_dict(
     {
         **CONF_ENTRY_LIBRARY_SYNC_PODCASTS.to_dict(),
+        "hidden": True,
+        "default_value": True,
+    }
+)
+CONF_ENTRY_LIBRARY_SYNC_RADIOS_HIDDEN = ConfigEntry.from_dict(
+    {
+        **CONF_ENTRY_LIBRARY_SYNC_RADIOS.to_dict(),
         "hidden": True,
         "default_value": True,
     }
@@ -90,6 +116,7 @@ class DRPodcastsProvider(MusicProvider):
     _index: list[IndexEntry]
     _index_expires: float
     _index_lock: asyncio.Lock
+    _streams: StreamResolver
 
     @property
     def max_concurrent_streams(self) -> None:
@@ -103,27 +130,31 @@ class DRPodcastsProvider(MusicProvider):
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Return Config entries to setup this provider."""
-        return (CONF_ENTRY_LIBRARY_SYNC_PODCASTS_HIDDEN,)
+        return (CONF_ENTRY_LIBRARY_SYNC_PODCASTS_HIDDEN, CONF_ENTRY_LIBRARY_SYNC_RADIOS_HIDDEN)
 
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
         self._index = []
         self._index_expires = 0.0
         self._index_lock = asyncio.Lock()
+        self._streams = StreamResolver(self._fetch_stream_page, self.logger)
 
     async def search(
         self, search_query: str, media_types: list[MediaType], limit: int = 5
     ) -> SearchResults:
-        """Search the title and description of every DR podcast."""
+        """Search the title and description of every DR podcast and the name of every channel."""
         result = SearchResults()
-        if MediaType.PODCAST not in media_types:
-            return result
-        entries = search_index(await self._get_index(), search_query, limit)
-        result.podcasts = [self._build_podcast(entry) for entry in entries]
+        if MediaType.PODCAST in media_types:
+            entries = search_index(await self._get_index(), search_query, limit)
+            result.podcasts = [self._build_podcast(entry) for entry in entries]
+        if MediaType.RADIO in media_types:
+            result.radio = [
+                self._build_radio(channel) for channel in search_channels(search_query, limit)
+            ]
         return result
 
     async def browse(self, path: str) -> Sequence[MediaItemType | ItemMapping | BrowseFolder]:
-        """Browse the DR podcasts by latest episode or by title."""
+        """Browse the DR podcasts by latest episode or by title, and the live radio channels."""
         folder = path.split("://", 1)[1].strip("/")
         if not folder:
             return [
@@ -135,6 +166,8 @@ class DRPodcastsProvider(MusicProvider):
                 )
                 for folder_id, name in BROWSE_FOLDERS.items()
             ]
+        if folder == BROWSE_RADIO:
+            return [self._build_radio(channel) for channel in CHANNELS]
         index = await self._get_index()
         if folder == BROWSE_RECENT:
             entries = recently_updated(index, BROWSE_RECENT_COUNT)
@@ -184,6 +217,15 @@ class DRPodcastsProvider(MusicProvider):
                 instance_id=self.instance_id,
                 domain=self.domain,
             )
+
+    async def get_library_radios(self) -> AsyncGenerator[Radio]:
+        """Get library radios, which are all the DR channels."""
+        for channel in CHANNELS:
+            yield self._build_radio(channel)
+
+    async def get_radio(self, prov_radio_id: str) -> Radio:
+        """Get radio."""
+        return self._build_radio(self._get_channel(prov_radio_id))
 
     async def get_podcast(self, prov_podcast_id: str) -> Podcast:
         """Get podcast."""
@@ -244,6 +286,17 @@ class DRPodcastsProvider(MusicProvider):
 
     async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
         """Get streamdetails for item."""
+        if media_type == MediaType.RADIO:
+            return StreamDetails(
+                provider=self.instance_id,
+                item_id=item_id,
+                audio_format=AudioFormat(content_type=ContentType.AAC, channels=2),
+                media_type=MediaType.RADIO,
+                stream_type=StreamType.HLS,
+                path=await self._streams.resolve(self._get_channel(item_id)),
+                can_seek=False,
+                allow_seek=False,
+            )
         podcast_id, guid_or_stream_url = item_id.split(" ")
         parsed_podcast = await self._cache_get_podcast(podcast_id)
         stream_url = find_episode_stream_url(
@@ -293,6 +346,46 @@ class DRPodcastsProvider(MusicProvider):
         if not entries:
             raise MediaNotFoundError("The DR podcast index lists no podcasts.")
         return entries
+
+    async def _fetch_stream_page(self, url: str) -> str:
+        try:
+            async with self.mass.http_session.get(
+                url, raise_for_status=True, timeout=STREAM_PAGE_TIMEOUT
+            ) as response:
+                return await response.text(errors="replace")
+        except (ClientError, TimeoutError) as err:
+            raise StreamPageError(f"Could not load {url}: {err}") from err
+
+    @staticmethod
+    def _get_channel(item_id: str) -> Channel:
+        if (channel := CHANNELS_BY_SLUG.get(item_id)) is None:
+            raise MediaNotFoundError(f"Unknown DR radio channel: {item_id}")
+        return channel
+
+    def _build_radio(self, channel: Channel) -> Radio:
+        radio = Radio(
+            item_id=channel.slug,
+            name=channel.name,
+            provider=self.instance_id,
+            provider_mappings={
+                ProviderMapping(
+                    item_id=channel.slug,
+                    provider_domain=self.domain,
+                    provider_instance=self.instance_id,
+                )
+            },
+        )
+        radio.metadata.images = UniqueList(
+            [
+                MediaItemImage(
+                    type=ImageType.THUMB,
+                    path=channel.logo_url,
+                    provider=self.instance_id,
+                    remotely_accessible=True,
+                )
+            ]
+        )
+        return radio
 
     def _build_podcast(self, entry: IndexEntry) -> Podcast:
         """Build a podcast from an index entry; the full details come from the feed."""

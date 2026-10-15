@@ -3,7 +3,7 @@
   "domain": "dr_podcasts",
   "stage": "stable",
   "name": "DR Podcasts",
-  "description": "Search, browse and play the DR podcasts that drpodcast.nu republishes as RSS feeds.",
+  "description": "Search, browse and play the DR podcasts that drpodcast.nu republishes as RSS feeds, and the DR live radio channels.",
   "codeowners": [],
   "requirements": [],
   "icon": "podcast",
