@@ -1,11 +1,14 @@
 """
-The DR live radio channels, how their stream urls are found and what they are playing.
+The DR live radio channels and what they are playing, from DR's radio API (see api.py).
 
-What a channel is playing comes from the radio API that the dr.dk/lyd web app itself calls,
-https://api.dr.dk/radio/v5, with no login. Two documents are read, as JSON:
+Three documents are read, as JSON:
 
+- GET /channels lists the channels. Per channel the fields used are slug, title, id, isFlowChannel,
+  isDistrict, audioAssets (format, url, bitrate) and channelLogos or imageAssets (id, target,
+  ratio). P4 and P5 carry their districts (P4 København, P5 København...) in districts, each of
+  them a channel of its own with a stream of its own.
 - GET /indexpoints/live/urn:dr:radio:channel:<id> lists the tracks the channel has played,
-  newest first. The id is the last part of channel.id in the schedules document below, so every
+  newest first. The id is the last part of the channel's id in the channels document, so every
   district has a list of its own. Per item the fields used are type ("Track"), title,
   playedTime (ISO 8601, the start of the track on the clock of the HLS stream),
   durationMilliseconds (what the track is scheduled to last), classical, description (the
@@ -26,30 +29,28 @@ track is not listed yet, the programme is shown.
 from __future__ import annotations
 
 import asyncio
-import re
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime
 from typing import TYPE_CHECKING, Any
+
+from .api import (
+    API_URL,
+    ApiError,
+    Cache,
+    clean_text,
+    image_url,
+    parse_time,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterable
     from logging import Logger
 
-PAGE_URL = "https://www.dr.dk/lyd/{}"
-FALLBACK_STREAM_URL = "https://drliveradio2.akamaized.net/hls/live/2118698/{}/masterab.m3u8"
-LOGO_URL = "https://www.dr.dk/lyd/_next/static/media/{}.svg"
-API_URL = "https://api.dr.dk/radio/v5"
-TRACKS_URL = f"{API_URL}/indexpoints/live/urn:dr:radio:channel:{{}}"
+CHANNELS_URL = f"{API_URL}/channels"
+TRACKS_URL = f"{API_URL}/indexpoints/live/{{}}"
 PROGRAMMES_URL = f"{API_URL}/schedules/all/now"
-IMAGE_URL = (
-    "https://asset.dr.dk/drlyd/images/{}"
-    "?im=AspectCrop%3D%28512%2C512%29%2CxPosition%3D.5%2CyPosition%3D.5%3BResize%3D%28512%2C512%29"
-)
-API_HEADERS = {"Accept": "application/json", "x-apikey": "6Wkh8s98Afx1ZAaTT4FuWODTmvWGDPpR"}
-STREAM_CACHE_SECONDS = 12 * 3600
-STREAM_RETRY_SECONDS = 10 * 60
+CHANNELS_CACHE_SECONDS = 12 * 3600
 NOW_PLAYING_CACHE_SECONDS = 30
 STREAM_DELAY_SECONDS = 30
 STREAM_METADATA_UPDATE_INTERVAL = 10
@@ -57,122 +58,136 @@ STREAM_METADATA_UPDATE_INTERVAL = 10
 
 @dataclass(frozen=True, slots=True)
 class Channel:
-    """One DR radio channel."""
+    """One DR radio channel that plays a live stream."""
 
     slug: str
     name: str
-    stream_slug: str
-    logo: str
-    channel_id: str
-
-    @property
-    def page_url(self) -> str:
-        """Return the url of the channel page, which holds the stream url."""
-        return PAGE_URL.format(self.slug)
-
-    @property
-    def fallback_stream_url(self) -> str:
-        """Return the stream url to use when the page does not give one."""
-        return FALLBACK_STREAM_URL.format(self.stream_slug)
-
-    @property
-    def logo_url(self) -> str:
-        """Return the url of the channel logo."""
-        return LOGO_URL.format(self.logo)
+    urn: str
+    stream_url: str
+    hls: bool
+    image_url: str | None
+    district: bool
 
     @property
     def tracks_url(self) -> str:
         """Return the url of the list of tracks the channel has played."""
-        return TRACKS_URL.format(self.channel_id)
+        return TRACKS_URL.format(self.urn)
 
 
-CHANNELS = (
-    Channel("p1", "DR P1", "p1", "p1.29c35f9c", "5fa156d1da351264f87b462d"),
-    Channel("p2", "DR P2", "p2", "p2.041e766f", "5fa156d2da351264f87b4633"),
-    Channel("p3", "DR P3", "p3", "p3.28743ad0", "5fa156d2da351264f87b4634"),
-    Channel("p4kbh", "DR P4 København", "p4kobenhavn", "p4.a9a465ed", "5fa156d3da351264f87b4651"),
-    Channel("p5kbh", "DR P5 København", "p5kobenhavn", "p5.1704bd78", "5fa156d5da351264f87b466f"),
-    Channel("p6beat", "DR P6 Beat", "p6", "p6beat.4efb4634", "5fa156d2da351264f87b463e"),
-    Channel("p8jazz", "DR P8 Jazz", "p8", "p8jazz.3748d702", "5fa156d1da351264f87b4631"),
-)
-CHANNELS_BY_SLUG = {channel.slug: channel for channel in CHANNELS}
-
-
-class StreamPageError(Exception):
-    """A channel page could not be loaded."""
-
-
-class NowPlayingError(Exception):
-    """A document about what a channel is playing could not be loaded."""
-
-
-def find_stream_url(html: str, channel: Channel) -> str | None:
+def _channel_name(slug: str, title: str) -> str:
     """
-    Return the HLS stream url of the channel from a dr.dk/lyd page.
+    Return the name of a channel, DR P3 for P3.
 
-    Every page lists the streams of all the channels, so the channel's own stream is picked
-    out by its stream slug. The host and the numeric id in the url change from time to time.
+    DR's title of P6 and P8 lacks what their slugs say: p6beat is DR P6 Beat, p8jazz is DR P8 Jazz.
     """
-    pattern = (
-        r"https://drliveradio\d*\.akamaized\.net/hls/live/\d+/"
-        rf"{re.escape(channel.stream_slug)}/masterab\.m3u8"
+    compact = title.replace(" ", "").casefold()
+    suffix = slug[len(compact) :] if slug.casefold().startswith(compact) else ""
+    return " ".join(part for part in ("DR", title, suffix.capitalize()) if part)
+
+
+def _stream(assets: Any) -> tuple[str, bool] | None:
+    """Return the url of the stream to play and whether it is HLS: the HLS one, else best ICY."""
+    hls: list[str] = []
+    icy: list[tuple[float, str]] = []
+    for asset in assets if isinstance(assets, list) else []:
+        url = clean_text(asset.get("url")) if isinstance(asset, dict) else None
+        if not url or not url.startswith(("https://", "http://")):
+            continue
+        if asset.get("format") == "HLS":
+            hls.append(url)
+        elif asset.get("format") == "ICY":
+            bitrate = asset.get("bitrate")
+            icy.append((bitrate if isinstance(bitrate, int | float) else 0, url))
+    if hls:
+        return hls[0], True
+    return (max(icy, key=lambda asset: asset[0])[1], False) if icy else None
+
+
+def _parse_channel(item: Any) -> Channel | None:
+    """Return the channel an item of the channels document describes, if it plays a stream."""
+    if not isinstance(item, dict) or not item.get("isFlowChannel"):
+        return None
+    slug = clean_text(item.get("slug"))
+    title = clean_text(item.get("title"))
+    urn = clean_text(item.get("id"))
+    stream = _stream(item.get("audioAssets"))
+    if slug is None or title is None or urn is None or stream is None:
+        return None
+    picture = image_url(item.get("channelLogos")) or image_url(
+        item.get("imageAssets"), "SquareImage"
     )
-    match = re.search(pattern, html)
-    return match.group(0) if match else None
+    return Channel(
+        slug,
+        _channel_name(slug, title),
+        urn,
+        stream[0],
+        stream[1],
+        picture,
+        bool(item.get("isDistrict")),
+    )
 
 
-def search_channels(query: str, limit: int) -> list[Channel]:
+def parse_channels(document: Any) -> list[Channel]:
+    """
+    Return the live radio channels of a channels document, in DR's order.
+
+    Like the web app, this lists the districts of P4 and P5 in place of P4 and P5 themselves, and
+    only the flow channels, which are the stations that play round the clock. The rest of the
+    channels are events and web feeds, or have no stream.
+    """
+    channels: dict[str, Channel] = {}
+    for entry in document if isinstance(document, list) else []:
+        districts = entry.get("districts") if isinstance(entry, dict) else None
+        for item in districts if isinstance(districts, list) and districts else [entry]:
+            if channel := _parse_channel(item):
+                channels.setdefault(channel.slug, channel)
+    return list(channels.values())
+
+
+def search_channels(channels: Iterable[Channel], query: str, limit: int) -> list[Channel]:
     """Return the channels whose name holds every word of the query, ignoring case."""
     words = query.casefold().split()
     if not words:
         return []
     matches = [
-        channel for channel in CHANNELS if all(word in channel.name.casefold() for word in words)
+        channel for channel in channels if all(word in channel.name.casefold() for word in words)
     ]
     return matches[:limit]
 
 
-class StreamResolver:
+class ChannelDirectory:
     """
-    Finds the stream url of a channel from its page and remembers the answer.
+    The live radio channels, read from DR's channels document and remembered.
 
-    The answer is kept for STREAM_CACHE_SECONDS. When the page cannot be read the last url
-    that was found is used, and the channel's fallback url before any was found. Such a
-    fallback is kept for STREAM_RETRY_SECONDS before the page is tried again.
+    The document is kept for CHANNELS_CACHE_SECONDS. When it cannot be read the last one that was
+    read is used, which keeps the stream urls of the channels playing.
     """
 
     def __init__(
         self,
-        fetch_page: Callable[[str], Awaitable[str]],
+        fetch_json: Callable[[str], Awaitable[Any]],
         logger: Logger,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        """Initialize with a coroutine that returns a page or raises StreamPageError."""
-        self._fetch_page = fetch_page
-        self._logger = logger
-        self._clock = clock
-        self._urls: dict[str, tuple[str, float]] = {}
-
-    async def resolve(self, channel: Channel) -> str:
-        """Return the stream url of the channel."""
-        cached = self._urls.get(channel.slug)
-        if cached and self._clock() < cached[1]:
-            return cached[0]
-        url: str | None = None
-        reason = f"{channel.page_url} lists no stream for it"
-        try:
-            url = find_stream_url(await self._fetch_page(channel.page_url), channel)
-        except StreamPageError as err:
-            reason = str(err)
-        if url is not None:
-            self._urls[channel.slug] = (url, self._clock() + STREAM_CACHE_SECONDS)
-            return url
-        url = cached[0] if cached else channel.fallback_stream_url
-        self._logger.warning(
-            "Could not find the stream of %s, using %s: %s", channel.name, url, reason
+        """Initialize with a coroutine that returns the JSON at a url or raises ApiError."""
+        self._fetch_json = fetch_json
+        self._cache = Cache(
+            "the DR radio channels", self._load, CHANNELS_CACHE_SECONDS, logger, clock
         )
-        self._urls[channel.slug] = (url, self._clock() + STREAM_RETRY_SECONDS)
-        return url
+
+    async def channels(self) -> list[Channel]:
+        """Return the channels that play a stream."""
+        return await self._cache.get()
+
+    async def find(self, slug: str) -> Channel | None:
+        """Return the channel with the slug, if DR lists it."""
+        return next((channel for channel in await self.channels() if channel.slug == slug), None)
+
+    async def _load(self, _key: str) -> list[Channel]:
+        channels = parse_channels(await self._fetch_json(CHANNELS_URL))
+        if not channels:
+            raise ApiError("DR lists no radio channels.")
+        return channels
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,27 +218,11 @@ class NowPlaying:
     image_url: str | None = None
 
 
-def _text(value: Any) -> str | None:
-    """Return the value stripped, if it is text with something in it."""
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    return None
-
-
-def _parse_time(value: Any) -> float | None:
-    """Return the epoch seconds of an ISO 8601 time that carries a UTC offset, else None."""
-    try:
-        moment = datetime.fromisoformat(value)
-    except (TypeError, ValueError):
-        return None
-    return moment.timestamp() if moment.tzinfo else None
-
-
 def _composers(item: dict[str, Any]) -> list[str]:
     """Return the names of the composers among the roles of a track, each one once."""
     roles = item.get("roles")
     names = [
-        _text(role.get("name"))
+        clean_text(role.get("name"))
         for role in (roles if isinstance(roles, list) else [])
         if isinstance(role, dict) and str(role.get("role")).casefold() == "komponist"
     ]
@@ -239,7 +238,7 @@ def _artist(item: dict[str, Any]) -> str | None:
     """
     if item.get("classical") and (composers := _composers(item)):
         return ", ".join(composers)
-    return _text(item.get("description"))
+    return clean_text(item.get("description"))
 
 
 def parse_tracks(document: Any) -> list[Track]:
@@ -253,8 +252,8 @@ def parse_tracks(document: Any) -> list[Track]:
     for item in items if isinstance(items, list) else []:
         if not isinstance(item, dict) or item.get("type") != "Track":
             continue
-        title = _text(item.get("title"))
-        start = _parse_time(item.get("playedTime"))
+        title = clean_text(item.get("title"))
+        start = parse_time(item.get("playedTime"))
         duration = item.get("durationMilliseconds")
         if title is None or start is None or not isinstance(duration, int | float) or duration <= 0:
             continue
@@ -268,17 +267,6 @@ def find_track(tracks: Iterable[Track], at: float) -> Track | None:
     return max(playing, key=lambda track: track.start, default=None)
 
 
-def _square_image_id(assets: Any) -> str | None:
-    """Return the id of the square image among the image assets of a programme, if any."""
-    candidates = []
-    for asset in assets if isinstance(assets, list) else []:
-        if not isinstance(asset, dict) or asset.get("ratio") != "1:1":
-            continue
-        if image_id := _text(asset.get("id")):
-            candidates.append((asset.get("target") != "SquareImage", image_id))
-    return min(candidates)[1] if candidates else None
-
-
 def find_programme(document: Any, channel: Channel, at: float) -> Programme | None:
     """Return the programme that the schedules document has on air on the channel at the time."""
     entries = document if isinstance(document, list) else []
@@ -286,12 +274,11 @@ def find_programme(document: Any, channel: Channel, at: float) -> Programme | No
         info = entry.get("channel") if isinstance(entry, dict) else None
         if not isinstance(info, dict) or info.get("slug") != channel.slug:
             continue
-        title = _text(entry.get("title"))
-        end = _parse_time(entry.get("endTime"))
+        title = clean_text(entry.get("title"))
+        end = parse_time(entry.get("endTime"))
         if title is None or end is None or end <= at:
             return None
-        image_id = _square_image_id(entry.get("imageAssets"))
-        return Programme(title, IMAGE_URL.format(image_id) if image_id else None, end)
+        return Programme(title, image_url(entry.get("imageAssets"), "SquareImage"), end)
     return None
 
 
@@ -311,7 +298,7 @@ class NowPlayingResolver:
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
     ) -> None:
-        """Initialize with a coroutine that returns the JSON at a url or raises NowPlayingError."""
+        """Initialize with a coroutine that returns the JSON at a url or raises ApiError."""
         self._fetch_json = fetch_json
         self._logger = logger
         self._clock = clock
@@ -326,11 +313,11 @@ class NowPlayingResolver:
         )
         at = self._wall_clock() - STREAM_DELAY_SECONDS
         programme = find_programme(programmes, channel, at)
-        image_url = programme.image_url if programme else None
+        picture = programme.image_url if programme else None
         if track := find_track(parse_tracks(tracks), at):
-            return NowPlaying(track.title, track.artist, image_url)
+            return NowPlaying(track.title, track.artist, picture)
         if programme:
-            return NowPlaying(programme.title, None, image_url)
+            return NowPlaying(programme.title, None, picture)
         return NowPlaying(channel.name)
 
     async def _load(self, url: str) -> Any:
@@ -341,7 +328,7 @@ class NowPlayingResolver:
             document = cached[0] if cached else None
             try:
                 document = await self._fetch_json(url)
-            except NowPlayingError as err:
+            except ApiError as err:
                 self._logger.debug("Keeping the last answer: %s", err)
             self._documents[url] = (document, self._clock() + NOW_PLAYING_CACHE_SECONDS)
             return document

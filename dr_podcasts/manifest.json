@@ -3,10 +3,10 @@
   "domain": "dr_podcasts",
   "stage": "stable",
   "name": "DR Podcasts",
-  "description": "Search, browse and play the DR podcasts that drpodcast.nu republishes as RSS feeds, and the DR live radio channels.",
+  "description": "Search, browse and play the DR podcasts and the DR live radio channels, all from DR's own radio API.",
   "codeowners": [],
   "requirements": [],
   "icon": "podcast",
-  "documentation": "https://drpodcast.nu/",
+  "documentation": "https://github.com/mikkelke/ma-dr-podcasts",
   "multi_instance": false
 }

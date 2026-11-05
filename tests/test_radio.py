@@ -1,214 +1,266 @@
 import asyncio
 import copy
-import importlib.util
-import json
 import logging
-import sys
 import unittest
-from datetime import datetime
-from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+from support import LOGGER_NAME, Clock, FakeApi, api, epoch, fixture, radio
 
-
-def load_radio_module():
-    spec = importlib.util.spec_from_file_location(
-        "dr_podcasts_radio", ROOT / "dr_podcasts" / "radio.py"
-    )
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-radio = load_radio_module()
-FIXTURES = ROOT / "tests" / "fixtures"
-HTML = (FIXTURES / "radio_page.html").read_text(encoding="utf-8")
-TRACKS_P3 = json.loads((FIXTURES / "radio_tracks_p3.json").read_text(encoding="utf-8"))
-TRACKS_P2 = json.loads((FIXTURES / "radio_tracks_p2.json").read_text(encoding="utf-8"))
-PROGRAMMES = json.loads((FIXTURES / "radio_programmes.json").read_text(encoding="utf-8"))
-CHANNELS = radio.CHANNELS_BY_SLUG
-LOGGER_NAME = "dr_podcasts_test"
+CHANNELS_DOCUMENT = fixture("channels.json")
+TRACKS_P3 = fixture("radio_tracks_p3.json")
+TRACKS_P2 = fixture("radio_tracks_p2.json")
+PROGRAMMES = fixture("radio_programmes.json")
+CHANNEL_LIST = radio.parse_channels(CHANNELS_DOCUMENT)
+CHANNELS = {channel.slug: channel for channel in CHANNEL_LIST}
 STREAM = "https://drliveradio2.akamaized.net/hls/live/2118698/{}/masterab.m3u8"
-MOVED_P3 = "https://drliveradio3.akamaized.net/hls/live/2200001/p3/masterab.m3u8"
-P3_PICTURE = (
-    "https://asset.dr.dk/drlyd/images/urn:dr:radio:image:6ad5c1091068ba26db3ae6da"
-    "?im=AspectCrop%3D%28512%2C512%29%2CxPosition%3D.5%2CyPosition%3D.5%3BResize%3D%28512%2C512%29"
-)
-
-
-def epoch(time_of_day):
-    """Return the epoch seconds of a time on the day of the captured fixtures."""
-    return datetime.fromisoformat(f"2026-11-05T{time_of_day}+00:00").timestamp()
+ICY_STREAM = "https://live-icy.dr.dk/A/{}.mp3"
+P3_LOGO = api.IMAGE_URL.format("urn:dr:radio:image:624c02604e30a95b58edee96")
+P3_PICTURE = api.IMAGE_URL.format("urn:dr:radio:image:6ad5c1091068ba26db3ae6da")
+LIBRARY_SLUGS = ["p1", "p2", "p3", "p4kbh", "p5kbh", "p6beat", "p8jazz"]
 
 
 def slugs(channels):
     return [channel.slug for channel in channels]
 
 
-class ChannelsTest(unittest.TestCase):
-    def test_the_national_channels_in_order(self):
+def document_with(slug, **changes):
+    """Return the channels document with changes made to the channel of the slug."""
+    document = copy.deepcopy(CHANNELS_DOCUMENT)
+    for entry in document:
+        for channel in [entry, *entry.get("districts", [])]:
+            if channel["slug"] == slug:
+                channel.update(changes)
+    return document
+
+
+def channel_item(slug="p9", **changes):
+    item = {
+        "slug": slug,
+        "title": "P9",
+        "id": f"urn:dr:radio:channel:{slug}",
+        "isFlowChannel": True,
+        "audioAssets": [{"format": "HLS", "url": STREAM.format(slug)}],
+    }
+    return {**item, **changes}
+
+
+class ParseChannelsTest(unittest.TestCase):
+    def test_the_flow_channels_in_the_order_of_dr(self):
         self.assertEqual(
-            [channel.name for channel in radio.CHANNELS],
+            slugs(CHANNEL_LIST),
+            ["p1", "p2", "p3", "p4kbh", "p4vest", "p4aarhus", "p5kbh", "p6beat", "p8jazz"],
+        )
+
+    def test_the_names(self):
+        self.assertEqual(
+            [channel.name for channel in CHANNEL_LIST],
             [
                 "DR P1",
                 "DR P2",
                 "DR P3",
                 "DR P4 København",
+                "DR P4 Midt & Vest",
+                "DR P4 Østjylland",
                 "DR P5 København",
                 "DR P6 Beat",
                 "DR P8 Jazz",
             ],
         )
 
-    def test_slugs_are_unique(self):
-        self.assertEqual(len(CHANNELS), len(radio.CHANNELS))
+    def test_the_item_ids_of_earlier_versions_are_still_channels(self):
+        self.assertEqual([slug for slug in LIBRARY_SLUGS if slug not in CHANNELS], [])
 
-    def test_urls(self):
-        p4 = CHANNELS["p4kbh"]
-        self.assertEqual(p4.page_url, "https://www.dr.dk/lyd/p4kbh")
-        self.assertEqual(p4.fallback_stream_url, STREAM.format("p4kobenhavn"))
-        self.assertEqual(p4.logo_url, "https://www.dr.dk/lyd/_next/static/media/p4.a9a465ed.svg")
+    def test_the_districts_stand_in_for_p4_and_p5(self):
+        self.assertNotIn("p4", CHANNELS)
+        self.assertNotIn("p5", CHANNELS)
         self.assertEqual(
-            p4.tracks_url,
+            [channel.slug for channel in CHANNEL_LIST if channel.district],
+            ["p4kbh", "p4vest", "p4aarhus", "p5kbh"],
+        )
+
+    def test_a_channel_with_districts_and_a_stream_is_listed_with_them(self):
+        document = [
+            channel_item("p4", districts=[channel_item("p4a"), channel_item("p4b")]),
+        ]
+        self.assertEqual(slugs(radio.parse_channels(document)), ["p4a", "p4b"])
+        document[0]["districts"] = []
+        self.assertEqual(slugs(radio.parse_channels(document)), ["p4"])
+
+    def test_leaves_out_what_is_not_a_station(self):
+        for slug in ("ly1", "p7mix", "special-radio", "mcrweb1", "dr-web-3", "p3webcam"):
+            self.assertNotIn(slug, CHANNELS)
+
+    def test_the_hls_stream_is_preferred(self):
+        self.assertEqual(CHANNELS["p3"].stream_url, STREAM.format("p3"))
+        self.assertTrue(CHANNELS["p3"].hls)
+        self.assertEqual(CHANNELS["p4kbh"].stream_url, STREAM.format("p4kobenhavn"))
+        self.assertEqual(CHANNELS["p6beat"].stream_url, STREAM.format("p6"))
+        self.assertEqual(CHANNELS["p8jazz"].stream_url, STREAM.format("p8"))
+
+    def test_the_best_icy_stream_when_there_is_no_hls_one(self):
+        p3 = next(item for item in CHANNELS_DOCUMENT if item["slug"] == "p3")
+        assets = [asset for asset in p3["audioAssets"] if asset["format"] != "HLS"]
+        [channel] = radio.parse_channels([channel_item("p3", audioAssets=assets)])
+        self.assertEqual(channel.stream_url, ICY_STREAM.format("A05H"))
+        self.assertFalse(channel.hls)
+
+    def test_leaves_out_a_channel_without_a_usable_stream(self):
+        for assets in (
+            None,
+            [],
+            "text",
+            [None, 5, {}],
+            [{"format": "HLS"}, {"format": "HLS", "url": " "}],
+            [{"format": "HLS", "url": "rtmp://example.com/live"}],
+            [{"format": "DASH", "url": STREAM.format("p9")}],
+        ):
+            self.assertEqual(radio.parse_channels([channel_item(audioAssets=assets)]), [], assets)
+
+    def test_leaves_out_a_channel_without_a_slug_a_title_or_an_id(self):
+        for change in ({"slug": None}, {"title": " "}, {"id": None}, {"isFlowChannel": None}):
+            self.assertEqual(radio.parse_channels([channel_item(**change)]), [], change)
+
+    def test_the_first_channel_of_a_slug_wins(self):
+        document = [channel_item("p9", title="First"), channel_item("p9", title="Second")]
+        self.assertEqual([channel.name for channel in radio.parse_channels(document)], ["DR First"])
+
+    def test_each_channel_has_a_track_list_of_its_own(self):
+        urls = {channel.tracks_url for channel in CHANNEL_LIST}
+        self.assertEqual(len(urls), len(CHANNEL_LIST))
+        self.assertEqual(
+            CHANNELS["p4kbh"].tracks_url,
             "https://api.dr.dk/radio/v5/indexpoints/live/"
             "urn:dr:radio:channel:5fa156d3da351264f87b4651",
         )
 
-    def test_every_channel_has_a_track_list_of_its_own(self):
-        urls = {channel.tracks_url for channel in radio.CHANNELS}
-        self.assertEqual(len(urls), len(radio.CHANNELS))
-
-
-class FindStreamUrlTest(unittest.TestCase):
-    def test_picks_the_channel_out_of_a_page_that_lists_every_channel(self):
-        self.assertEqual(radio.find_stream_url(HTML, CHANNELS["p3"]), STREAM.format("p3"))
-        self.assertEqual(radio.find_stream_url(HTML, CHANNELS["p8jazz"]), STREAM.format("p8"))
-
-    def test_uses_the_stream_slug_rather_than_the_page_slug(self):
+    def test_the_picture_is_the_logo_else_the_square_picture(self):
+        self.assertEqual(CHANNELS["p3"].image_url, P3_LOGO)
+        document = document_with("p3", channelLogos=[])
         self.assertEqual(
-            radio.find_stream_url(HTML, CHANNELS["p4kbh"]), STREAM.format("p4kobenhavn")
+            next(c for c in radio.parse_channels(document) if c.slug == "p3").image_url,
+            api.IMAGE_URL.format("urn:dr:radio:image:6499a86d2222ea4246b8340d"),
         )
-        self.assertEqual(
-            radio.find_stream_url(HTML, CHANNELS["p5kbh"]), STREAM.format("p5kobenhavn")
+        document = document_with("p3", channelLogos=[], imageAssets=[])
+        self.assertIsNone(
+            next(c for c in radio.parse_channels(document) if c.slug == "p3").image_url
         )
-        self.assertEqual(radio.find_stream_url(HTML, CHANNELS["p6beat"]), STREAM.format("p6"))
 
-    def test_follows_a_new_host_and_id(self):
-        html = HTML.replace(STREAM.format("p3"), MOVED_P3)
-        self.assertEqual(radio.find_stream_url(html, CHANNELS["p3"]), MOVED_P3)
+    def test_names_follow_the_slug_where_dr_titles_a_channel_short(self):
+        for slug, title, name in (
+            ("p6beat", "P6", "DR P6 Beat"),
+            ("p8jazz", "P8", "DR P8 Jazz"),
+            ("p4kbh", "P4 København", "DR P4 København"),
+            ("p3", "P3", "DR P3"),
+            ("p4vest", "P4 Midt & Vest", "DR P4 Midt & Vest"),
+        ):
+            [channel] = radio.parse_channels([channel_item(slug, title=title)])
+            self.assertEqual(channel.name, name)
 
-    def test_matches_whole_slugs_only(self):
-        html = f'"{STREAM.format("p10")}" "{STREAM.format("xp1")}" "{STREAM.format("p1x")}"'
-        self.assertIsNone(radio.find_stream_url(html, CHANNELS["p1"]))
-
-    def test_none_when_the_page_lacks_the_channel(self):
-        self.assertIsNone(radio.find_stream_url(HTML, CHANNELS["p2"]))
-
-    def test_none_for_a_page_without_streams(self):
-        html = "<html><body>Maintenance</body></html>"
-        self.assertIsNone(radio.find_stream_url(html, CHANNELS["p3"]))
+    def test_unreadable_documents_have_no_channels(self):
+        for document in (None, {}, "text", 5, [], [None, 5, "x", []], [{"districts": "x"}]):
+            self.assertEqual(radio.parse_channels(document), [])
 
 
 class SearchChannelsTest(unittest.TestCase):
     def test_matches_the_name_ignoring_case(self):
-        self.assertEqual(slugs(radio.search_channels("dr P3", 10)), ["p3"])
-        self.assertEqual(slugs(radio.search_channels("jazz", 10)), ["p8jazz"])
+        self.assertEqual(slugs(radio.search_channels(CHANNEL_LIST, "dr P3", 10)), ["p3"])
+        self.assertEqual(slugs(radio.search_channels(CHANNEL_LIST, "jazz", 10)), ["p8jazz"])
 
     def test_every_word_must_match(self):
-        self.assertEqual(slugs(radio.search_channels("københavn", 10)), ["p4kbh", "p5kbh"])
-        self.assertEqual(slugs(radio.search_channels("p4 københavn", 10)), ["p4kbh"])
-        self.assertEqual(radio.search_channels("p3 jazz", 10), [])
+        self.assertEqual(
+            slugs(radio.search_channels(CHANNEL_LIST, "københavn", 10)), ["p4kbh", "p5kbh"]
+        )
+        self.assertEqual(slugs(radio.search_channels(CHANNEL_LIST, "p4 københavn", 10)), ["p4kbh"])
+        self.assertEqual(radio.search_channels(CHANNEL_LIST, "p3 jazz", 10), [])
+
+    def test_districts_are_found_too(self):
+        self.assertEqual(
+            slugs(radio.search_channels(CHANNEL_LIST, "p4", 10)),
+            [
+                "p4kbh",
+                "p4vest",
+                "p4aarhus",
+            ],
+        )
 
     def test_limit(self):
-        self.assertEqual(len(radio.search_channels("dr", 3)), 3)
+        self.assertEqual(len(radio.search_channels(CHANNEL_LIST, "dr", 3)), 3)
 
     def test_blank_query_matches_nothing(self):
-        self.assertEqual(radio.search_channels("  ", 10), [])
+        self.assertEqual(radio.search_channels(CHANNEL_LIST, "  ", 10), [])
 
 
-class Clock:
-    def __init__(self):
-        self.now = 1000.0
-
-    def __call__(self):
-        return self.now
-
-
-class Pages:
-    """Stands in for the dr.dk/lyd pages."""
-
-    def __init__(self):
-        self.html = HTML
-        self.error = None
-        self.requests = []
-
-    async def __call__(self, url):
-        self.requests.append(url)
-        if self.error:
-            raise radio.StreamPageError(self.error)
-        return self.html
-
-
-class StreamResolverTest(unittest.IsolatedAsyncioTestCase):
+class ChannelDirectoryTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.pages = Pages()
+        self.api = FakeApi({radio.CHANNELS_URL: CHANNELS_DOCUMENT})
         self.clock = Clock()
-        self.resolver = radio.StreamResolver(self.pages, logging.getLogger(LOGGER_NAME), self.clock)
+        self.directory = radio.ChannelDirectory(
+            self.api, logging.getLogger(LOGGER_NAME), self.clock
+        )
 
-    async def test_reads_the_url_from_the_channel_page(self):
-        url = await self.resolver.resolve(CHANNELS["p4kbh"])
-        self.assertEqual(url, STREAM.format("p4kobenhavn"))
-        self.assertEqual(self.pages.requests, ["https://www.dr.dk/lyd/p4kbh"])
+    async def test_reads_the_channels_of_dr(self):
+        self.assertEqual(slugs(await self.directory.channels()), slugs(CHANNEL_LIST))
+        self.assertEqual(self.api.requests, ["https://api.dr.dk/radio/v5/channels"])
 
-    async def test_keeps_the_url_for_twelve_hours(self):
-        await self.resolver.resolve(CHANNELS["p3"])
-        self.clock.now += radio.STREAM_CACHE_SECONDS - 1
-        self.assertEqual(await self.resolver.resolve(CHANNELS["p3"]), STREAM.format("p3"))
-        self.assertEqual(len(self.pages.requests), 1)
-        self.pages.html = HTML.replace(STREAM.format("p3"), MOVED_P3)
+    async def test_finds_a_channel_by_its_slug(self):
+        channel = await self.directory.find("p3")
+        self.assertEqual((channel.slug, channel.name), ("p3", "DR P3"))
+        self.assertIsNone(await self.directory.find("p4"))
+        self.assertIsNone(await self.directory.find("nope"))
+
+    async def test_keeps_the_channels_for_twelve_hours(self):
+        await self.directory.channels()
+        self.clock.now += radio.CHANNELS_CACHE_SECONDS - 1
+        await self.directory.find("p3")
+        self.assertEqual(len(self.api.requests), 1)
+        self.api.documents[radio.CHANNELS_URL] = document_with(
+            "p3", audioAssets=[{"format": "HLS", "url": STREAM.format("moved")}]
+        )
         self.clock.now += 1
-        self.assertEqual(await self.resolver.resolve(CHANNELS["p3"]), MOVED_P3)
-        self.assertEqual(len(self.pages.requests), 2)
+        self.assertEqual((await self.directory.find("p3")).stream_url, STREAM.format("moved"))
+        self.assertEqual(len(self.api.requests), 2)
 
-    async def test_channels_are_kept_apart(self):
-        await self.resolver.resolve(CHANNELS["p3"])
-        self.assertEqual(await self.resolver.resolve(CHANNELS["p6beat"]), STREAM.format("p6"))
-        self.assertEqual(len(self.pages.requests), 2)
-
-    async def test_unreadable_page_gives_the_fixed_url_when_no_url_was_found_before(self):
-        self.pages.error = "Could not load the page"
+    async def test_the_last_channels_when_dr_cannot_be_read(self):
+        await self.directory.channels()
+        self.clock.now += radio.CHANNELS_CACHE_SECONDS
+        self.api.fail(radio.CHANNELS_URL)
         with self.assertLogs(LOGGER_NAME, "WARNING") as logs:
-            url = await self.resolver.resolve(CHANNELS["p3"])
-        self.assertEqual(url, CHANNELS["p3"].fallback_stream_url)
-        self.assertIn("Could not load the page", logs.output[0])
+            channels = await self.directory.channels()
+        self.assertEqual(slugs(channels), slugs(CHANNEL_LIST))
+        self.assertIn("Could not load the document", logs.output[0])
 
-    async def test_page_without_the_channel_gives_the_fixed_url(self):
+    async def test_tries_again_after_ten_minutes(self):
+        await self.directory.channels()
+        self.clock.now += radio.CHANNELS_CACHE_SECONDS
+        self.api.fail(radio.CHANNELS_URL)
         with self.assertLogs(LOGGER_NAME, "WARNING"):
-            url = await self.resolver.resolve(CHANNELS["p2"])
-        self.assertEqual(url, STREAM.format("p2"))
-
-    async def test_unreadable_page_gives_the_last_url_that_was_found(self):
-        self.pages.html = HTML.replace(STREAM.format("p3"), MOVED_P3)
-        await self.resolver.resolve(CHANNELS["p3"])
-        self.clock.now += radio.STREAM_CACHE_SECONDS
-        self.pages.error = "Could not load the page"
-        with self.assertLogs(LOGGER_NAME, "WARNING"):
-            url = await self.resolver.resolve(CHANNELS["p3"])
-        self.assertEqual(url, MOVED_P3)
-
-    async def test_retries_an_unreadable_page_after_ten_minutes(self):
-        self.pages.error = "Could not load the page"
-        with self.assertLogs(LOGGER_NAME, "WARNING"):
-            await self.resolver.resolve(CHANNELS["p3"])
-            self.clock.now += radio.STREAM_RETRY_SECONDS - 1
-            await self.resolver.resolve(CHANNELS["p3"])
-        self.assertEqual(len(self.pages.requests), 1)
-        self.pages.error = None
-        self.pages.html = HTML.replace(STREAM.format("p3"), MOVED_P3)
+            await self.directory.channels()
+            self.clock.now += api.RETRY_SECONDS - 1
+            await self.directory.channels()
+        self.assertEqual(len(self.api.requests), 2)
+        self.api.fail()
         self.clock.now += 1
-        self.assertEqual(await self.resolver.resolve(CHANNELS["p3"]), MOVED_P3)
-        self.assertEqual(len(self.pages.requests), 2)
+        await self.directory.channels()
+        self.assertEqual(len(self.api.requests), 3)
+
+    async def test_an_error_when_dr_cannot_be_read_and_nothing_was_read_before(self):
+        self.api.fail(radio.CHANNELS_URL)
+        with self.assertRaises(api.ApiError):
+            await self.directory.channels()
+
+    async def test_an_error_for_a_document_without_channels(self):
+        self.api.documents[radio.CHANNELS_URL] = [{"slug": "p9"}]
+        with self.assertRaisesRegex(api.ApiError, "no radio channels"):
+            await self.directory.channels()
+        self.api.documents[radio.CHANNELS_URL] = {"error": "maintenance"}
+        with self.assertRaises(api.ApiError):
+            await self.directory.find("p3")
+
+    async def test_a_bad_document_keeps_the_last_channels(self):
+        await self.directory.channels()
+        self.clock.now += radio.CHANNELS_CACHE_SECONDS
+        self.api.documents[radio.CHANNELS_URL] = []
+        with self.assertLogs(LOGGER_NAME, "WARNING"):
+            self.assertEqual(slugs(await self.directory.channels()), slugs(CHANNEL_LIST))
 
 
 def track_item(**changes):
@@ -344,7 +396,7 @@ class FindProgrammeTest(unittest.TestCase):
             {"id": "urn:dr:radio:image:c", "target": "Default", "ratio": "16:9"},
         ]
         picture = self.find("p3", document=document).image_url
-        self.assertEqual(picture, radio.IMAGE_URL.format("urn:dr:radio:image:b"))
+        self.assertEqual(picture, api.IMAGE_URL.format("urn:dr:radio:image:b"))
 
     def test_no_picture_without_a_square_one(self):
         document = copy.deepcopy(PROGRAMMES)
@@ -379,28 +431,18 @@ class FindProgrammeTest(unittest.TestCase):
             self.assertIsNone(self.find("p3", document=document))
 
 
-class Documents:
-    """Stands in for the DR radio API."""
+class Documents(FakeApi):
+    """Stands in for the now-playing documents of DR's radio API."""
 
     def __init__(self):
-        self.documents = {
-            CHANNELS["p3"].tracks_url: TRACKS_P3,
-            CHANNELS["p2"].tracks_url: TRACKS_P2,
-            CHANNELS["p8jazz"].tracks_url: {"items": []},
-            radio.PROGRAMMES_URL: PROGRAMMES,
-        }
-        self.errors = {}
-        self.requests = []
-
-    async def __call__(self, url):
-        self.requests.append(url)
-        await asyncio.sleep(0)
-        if url in self.errors:
-            raise radio.NowPlayingError(self.errors[url])
-        return self.documents[url]
-
-    def fail(self, *urls):
-        self.errors = {url: "Could not load the document" for url in urls}
+        super().__init__(
+            {
+                CHANNELS["p3"].tracks_url: TRACKS_P3,
+                CHANNELS["p2"].tracks_url: TRACKS_P2,
+                CHANNELS["p8jazz"].tracks_url: {"items": []},
+                radio.PROGRAMMES_URL: PROGRAMMES,
+            }
+        )
 
 
 class NowPlayingResolverTest(unittest.IsolatedAsyncioTestCase):
@@ -451,6 +493,12 @@ class NowPlayingResolverTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(playing, radio.NowPlaying("Den sidste time", None, P3_PICTURE))
         self.assertIn("Could not load the document", logs.output[0])
         self.assertEqual({record.levelno for record in logs.records}, {logging.DEBUG})
+
+    async def test_the_programme_when_dr_refuses_the_track_list(self):
+        self.api.errors[CHANNELS["p3"].tracks_url] = api.NotFoundError("DR has nothing there")
+        self.assertEqual(
+            await self.resolve(), radio.NowPlaying("Den sidste time", None, P3_PICTURE)
+        )
 
     async def test_the_track_without_a_picture_when_the_programmes_cannot_be_loaded(self):
         self.api.fail(radio.PROGRAMMES_URL)
