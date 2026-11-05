@@ -27,7 +27,7 @@ from music_assistant_models.media_items import (
     SearchResults,
     UniqueList,
 )
-from music_assistant_models.streamdetails import StreamDetails
+from music_assistant_models.streamdetails import StreamDetails, StreamMetadata
 
 from music_assistant.constants import (
     CONF_ENTRY_LIBRARY_SYNC_PODCASTS,
@@ -46,9 +46,13 @@ from music_assistant.models.music_provider import MusicProvider
 
 from .index import INDEX_URL, IndexEntry, parse_index, recently_updated, search_index
 from .radio import (
+    API_HEADERS,
     CHANNELS,
     CHANNELS_BY_SLUG,
+    STREAM_METADATA_UPDATE_INTERVAL,
     Channel,
+    NowPlayingError,
+    NowPlayingResolver,
     StreamPageError,
     StreamResolver,
     search_channels,
@@ -70,6 +74,7 @@ INDEX_RETRY_SECONDS = 10 * 60
 INDEX_TIMEOUT = ClientTimeout(total=30)
 FEED_CACHE_SECONDS = 15 * 60
 STREAM_PAGE_TIMEOUT = ClientTimeout(total=10)
+NOW_PLAYING_TIMEOUT = ClientTimeout(total=10)
 BROWSE_RECENT = "recent"
 BROWSE_ALL = "all"
 BROWSE_RADIO = "radio"
@@ -117,6 +122,7 @@ class DRPodcastsProvider(MusicProvider):
     _index_expires: float
     _index_lock: asyncio.Lock
     _streams: StreamResolver
+    _now_playing: NowPlayingResolver
 
     @property
     def max_concurrent_streams(self) -> None:
@@ -138,6 +144,7 @@ class DRPodcastsProvider(MusicProvider):
         self._index_expires = 0.0
         self._index_lock = asyncio.Lock()
         self._streams = StreamResolver(self._fetch_stream_page, self.logger)
+        self._now_playing = NowPlayingResolver(self._fetch_now_playing, self.logger)
 
     async def search(
         self, search_query: str, media_types: list[MediaType], limit: int = 5
@@ -296,6 +303,8 @@ class DRPodcastsProvider(MusicProvider):
                 path=await self._streams.resolve(self._get_channel(item_id)),
                 can_seek=False,
                 allow_seek=False,
+                stream_metadata_update_callback=self._update_stream_metadata,
+                stream_metadata_update_interval=STREAM_METADATA_UPDATE_INTERVAL,
             )
         podcast_id, guid_or_stream_url = item_id.split(" ")
         parsed_podcast = await self._cache_get_podcast(podcast_id)
@@ -355,6 +364,26 @@ class DRPodcastsProvider(MusicProvider):
                 return await response.text(errors="replace")
         except (ClientError, TimeoutError) as err:
             raise StreamPageError(f"Could not load {url}: {err}") from err
+
+    async def _fetch_now_playing(self, url: str) -> Any:
+        try:
+            async with self.mass.http_session.get(
+                url, headers=API_HEADERS, raise_for_status=True, timeout=NOW_PLAYING_TIMEOUT
+            ) as response:
+                return await response.json()
+        except (ClientError, TimeoutError, ValueError) as err:
+            raise NowPlayingError(f"Could not load {url}: {err}") from err
+
+    async def _update_stream_metadata(
+        self, stream_details: StreamDetails, elapsed_time: int
+    ) -> None:
+        """Show what DR is playing on the channel; the player queue controller calls this."""
+        if (channel := CHANNELS_BY_SLUG.get(stream_details.item_id)) is None:
+            return
+        playing = await self._now_playing.resolve(channel)
+        stream_details.stream_metadata = StreamMetadata(
+            title=playing.title, artist=playing.artist, image_url=playing.image_url
+        )
 
     @staticmethod
     def _get_channel(item_id: str) -> Channel:

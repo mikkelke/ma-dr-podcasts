@@ -7,6 +7,7 @@ A Music Assistant music provider for the DR podcasts that [drpodcast.nu](https:/
 - Podcasts added to the Music Assistant library are refreshed by the library sync. Episodes and streams come from the RSS feeds.
 - The radio channels are P1, P2, P3, P4 København, P5 København, P6 Beat and P8 Jazz. The library sync keeps all of them in the library.
 - A channel's HLS stream url is read from its dr.dk/lyd page when it is played and kept for 12 hours. If the page cannot be read, the last url that was found is used, and before any was found the fixed url in `dr_podcasts/radio.py`.
+- The title of a playing radio channel is the track DR lists as playing (artist and title, the composers for classical music), else the programme on air, else the channel name. It comes from DR's radio API, at most one request every 30 seconds per list. DR lists a track about 50 seconds after it starts, and a channel's track list is served without a key only while DR's CDN holds a copy, so a title can be late and quiet channels show their programme more often.
 
 ## Install
 
