@@ -15,8 +15,8 @@ https://api.dr.dk/radio/v5, with no login. Two documents are read, as JSON:
 
 The tracks list is served without a key only while DR's CDN holds a copy that someone else
 requested a few seconds earlier, so a busy channel mostly answers and a quiet one rarely does;
-otherwise it answers 401. The web app sends an x-apikey header with these requests, which
-API_HEADERS can carry.
+otherwise it answers 401. API_HEADERS carries the public x-apikey that the web app sends with
+these requests.
 
 DR lists a track well after it has started, and the stream is played from a few segments behind
 its live edge, so what a listener hears is looked up STREAM_DELAY_SECONDS back in time. While a
@@ -47,7 +47,7 @@ IMAGE_URL = (
     "https://asset.dr.dk/drlyd/images/{}"
     "?im=AspectCrop%3D%28512%2C512%29%2CxPosition%3D.5%2CyPosition%3D.5%3BResize%3D%28512%2C512%29"
 )
-API_HEADERS = {"Accept": "application/json"}
+API_HEADERS = {"Accept": "application/json", "x-apikey": "6Wkh8s98Afx1ZAaTT4FuWODTmvWGDPpR"}
 STREAM_CACHE_SECONDS = 12 * 3600
 STREAM_RETRY_SECONDS = 10 * 60
 NOW_PLAYING_CACHE_SECONDS = 30
